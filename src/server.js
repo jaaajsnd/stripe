@@ -1,7 +1,8 @@
 require('dotenv').config();
 const express = require('express');
-const axios = require('axios');
 const bodyParser = require('body-parser');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY || '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');
+const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -10,8 +11,6 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
 const APP_URL = process.env.APP_URL || 'http://localhost:10000';
-const PAYMENT_USERNAME = process.env.PAYMENT_USERNAME || '@username';
-
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
@@ -29,7 +28,7 @@ async function sendTelegramMessage(text) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'active', message: 'Payment Link Gateway Running' });
+  res.json({ status: 'active', message: 'Stripe Gateway Running' });
 });
 
 app.get('/health', (req, res) => {
@@ -51,8 +50,6 @@ app.post('/checkout', async (req, res) => {
       console.error('Error parsing cart_items:', e);
     }
   }
-
-  const paymentLink = `https://pay.example.com/${PAYMENT_USERNAME}/${amount}`;
 
   res.send(`
     <html>
@@ -80,11 +77,14 @@ app.post('/checkout', async (req, res) => {
           .form-group { margin-bottom: 12px; }
           label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
           input { width: 100%; padding: 12px 14px; border: 1px solid #d9d9d9; border-radius: 5px; font-size: 14px; }
-          input:focus { outline: none; border-color: #2c6ecb; }
+          input:focus { outline: none; border-color: #635bff; }
           .form-row { display: flex; gap: 12px; }
           .form-row .form-group { flex: 1; }
-          .pay-button { width: 100%; padding: 18px; background: #2c6ecb; color: white; border: none; border-radius: 5px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 24px; }
-          .pay-button:hover { background: #1f5bb5; }
+          .pay-button { width: 100%; padding: 18px; background: #635bff; color: white; border: none; border-radius: 5px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 24px; }
+          .pay-button:hover { background: #5348e0; }
+          .pay-button:disabled { background: #d9d9d9; cursor: not-allowed; }
+          .error { background: #fff4f4; border: 1px solid #ffcdd2; color: #c62828; padding: 12px 16px; border-radius: 5px; margin: 16px 0; display: none; }
+          .loading { display: none; text-align: center; padding: 16px; color: #717171; }
           @media (max-width: 1000px) { .checkout-container { flex-direction: column-reverse; } .order-summary, .payment-form { width: 100%; padding: 30px 20px; } }
         </style>
       </head>
@@ -99,6 +99,8 @@ app.post('/checkout', async (req, res) => {
             </div>
           </div>
           <div class="payment-form">
+            <div id="error-message" class="error"></div>
+            <div id="loading-message" class="loading">Betaling verwerken...</div>
             <div class="section">
               <div class="section-title">Contact</div>
               <div class="form-group"><label for="email">E-mailadres</label><input type="email" id="email" required></div>
@@ -149,24 +151,32 @@ app.post('/checkout', async (req, res) => {
             };
             
             if (!customerData.firstName || !customerData.email) {
-              alert('Vul alle velden in');
+              document.getElementById('error-message').style.display = 'block';
+              document.getElementById('error-message').innerHTML = 'Vul alle velden in';
               return;
             }
 
-            // Send notification to Telegram
-            await fetch('/api/notify', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ 
-                amount: '${amount}', 
-                customerData, 
-                cartData, 
-                orderId: '${order_id || ''}' 
-              })
-            });
+            document.getElementById('loading-message').style.display = 'block';
+            document.querySelector('.pay-button').disabled = true;
 
-            // Redirect to payment link
-            window.location.href = '${paymentLink}';
+            try {
+              const response = await fetch('/api/create-payment', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ amount: '${amount}', currency: 'EUR', customerData, cartData, orderId: '${order_id || ''}', returnUrl: '${return_url || ''}' })
+              });
+              const data = await response.json();
+              if (data.url) {
+                window.location.href = data.url;
+              } else {
+                throw new Error('Kon betaling niet starten');
+              }
+            } catch (error) {
+              document.getElementById('loading-message').style.display = 'none';
+              document.getElementById('error-message').style.display = 'block';
+              document.getElementById('error-message').innerHTML = error.message;
+              document.querySelector('.pay-button').disabled = false;
+            }
           }
         </script>
       </body>
@@ -174,38 +184,78 @@ app.post('/checkout', async (req, res) => {
   `);
 });
 
-app.post('/api/notify', async (req, res) => {
+app.post('/api/create-payment', async (req, res) => {
   try {
-    const { amount, customerData, cartData, orderId } = req.body;
+    const { amount, customerData, cartData, orderId, returnUrl } = req.body;
 
-    let productsText = '';
-    if (cartData && cartData.items) {
-      productsText = '\n\n<b>🛒 Producten:</b>\n';
-      cartData.items.forEach(item => {
-        const itemPrice = (item.line_price || (item.price * item.quantity)) / 100;
-        productsText += `• ${item.quantity}x ${item.title} - €${itemPrice.toFixed(2)}\n`;
-      });
+    const session = await stripe.checkout.sessions.create({
+      line_items: [{
+        price_data: {
+          currency: 'eur',
+          product_data: {
+            name: `Bestelling ${orderId || Date.now()}`
+          },
+          unit_amount: Math.round(parseFloat(amount) * 100)
+        },
+        quantity: 1
+      }],
+      mode: 'payment',
+      success_url: `${APP_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}&return_url=${encodeURIComponent(returnUrl || APP_URL)}`,
+      cancel_url: returnUrl || APP_URL,
+      customer_email: customerData.email,
+      metadata: {
+        order_id: orderId || '',
+        customer_name: `${customerData.firstName} ${customerData.lastName}`,
+        cart_data: JSON.stringify(cartData)
+      }
+    });
+
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error('Error:', error.message);
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/payment/success', async (req, res) => {
+  const { session_id, return_url } = req.query;
+  
+  try {
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    
+    if (session.payment_status === 'paid') {
+      let productsText = '';
+      if (session.metadata?.cart_data) {
+        try {
+          const cartData = JSON.parse(session.metadata.cart_data);
+          if (cartData && cartData.items) {
+            productsText = '\n\n<b>🛒 Producten:</b>\n';
+            cartData.items.forEach(item => {
+              const itemPrice = (item.line_price || (item.price * item.quantity)) / 100;
+              productsText += `• ${item.quantity}x ${item.title} - €${itemPrice.toFixed(2)}\n`;
+            });
+          }
+        } catch (e) {}
+      }
+      
+      const message = `
+<b>✅ BETALING ONTVANGEN - STRIPE</b>
+
+<b>💰 Bedrag:</b> €${(session.amount_total / 100).toFixed(2)}
+<b>👤 Klant:</b> ${session.metadata.customer_name}
+<b>📧 Email:</b> ${session.customer_email}
+<b>🆔 Session ID:</b> ${session_id}${productsText}
+
+<b>✓ Status:</b> Betaald
+      `.trim();
+      
+      await sendTelegramMessage(message);
     }
-
-    const message = `
-<b>🛒 NIEUWE CHECKOUT</b>
-
-<b>💰 Bedrag:</b> €${amount}
-<b>👤 Klant:</b> ${customerData.firstName} ${customerData.lastName}
-<b>📧 Email:</b> ${customerData.email}
-<b>📍 Adres:</b> ${customerData.address}, ${customerData.postalCode} ${customerData.city}${productsText}
-
-<b>🔗 Payment Link:</b> https://pay.example.com/${PAYMENT_USERNAME}/${amount}
-
-<i>⏳ Wachten op betaling...</i>
-    `.trim();
-
-    await sendTelegramMessage(message);
-    res.json({ status: 'success' });
   } catch (error) {
     console.error('Error:', error);
-    res.status(500).json({ status: 'error' });
   }
+  
+  res.send(`<html><head><title>Betaling</title><style>body{font-family:Arial;text-align:center;padding:50px;background:#f5f5f5}.box{background:white;padding:40px;border-radius:10px;max-width:500px;margin:0 auto}</style></head><body><div class="box"><h1>✓ Betaling geslaagd!</h1><p>Je wordt doorgestuurd...</p></div><script>setTimeout(()=>{window.location.href='${return_url || '/'}'},3000);</script></body></html>`);
 });
 
 app.listen(PORT, () => {
